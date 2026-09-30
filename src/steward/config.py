@@ -19,6 +19,21 @@ def _parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _parse_csv(value: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def _parse_float(name: str, value: str, default: float) -> float:
+    raw = value.strip() or str(default)
+    try:
+        parsed = float(raw)
+    except ValueError:
+        raise ConfigError(f"{name} must be a number") from None
+    if parsed < 0:
+        raise ConfigError(f"{name} must not be negative")
+    return parsed
+
+
 def _require(name: str, env: dict[str, str], *, dry_run: bool) -> str:
     value = env.get(name, "").strip()
     if value:
@@ -46,6 +61,13 @@ class Settings:
     smtp_from: str = ""
     alert_to: str = ""
     healthcheck_url: str = ""
+    dashboard_base_url: str = "http://localhost:8000"
+    port: int = 8000
+    db_path: str = "data/steward.db"
+    redact_allow: tuple[str, ...] = ()
+    redact_deny: tuple[str, ...] = ()
+    llm_price_input_per_1k: float = 0.0
+    llm_price_output_per_1k: float = 0.0
     dry_run: bool = False
 
     @classmethod
@@ -69,6 +91,14 @@ class Settings:
         if not 1 <= smtp_port <= 65535:
             raise ConfigError("SMTP_PORT must be between 1 and 65535")
 
+        port_raw = env.get("PORT", "8000").strip() or "8000"
+        try:
+            port = int(port_raw)
+        except ValueError:
+            raise ConfigError("PORT must be an integer") from None
+        if not 1 <= port <= 65535:
+            raise ConfigError("PORT must be between 1 and 65535")
+
         return cls(
             llm_base_url=llm_base_url,
             llm_api_key=_require("LLM_API_KEY", env, dry_run=dry_run),
@@ -82,6 +112,18 @@ class Settings:
             smtp_from=env.get("SMTP_FROM", "").strip(),
             alert_to=env.get("ALERT_TO", "").strip(),
             healthcheck_url=env.get("HEALTHCHECK_URL", "").strip(),
+            dashboard_base_url=env.get("DASHBOARD_BASE_URL", "").strip()
+            or "http://localhost:8000",
+            port=port,
+            db_path=env.get("STEWARD_DB", "").strip() or "data/steward.db",
+            redact_allow=_parse_csv(env.get("REDACT_ALLOW", "")),
+            redact_deny=_parse_csv(env.get("REDACT_DENY", "")),
+            llm_price_input_per_1k=_parse_float(
+                "LLM_PRICE_INPUT_PER_1K",
+                env.get("LLM_PRICE_INPUT_PER_1K", ""), 0.0),
+            llm_price_output_per_1k=_parse_float(
+                "LLM_PRICE_OUTPUT_PER_1K",
+                env.get("LLM_PRICE_OUTPUT_PER_1K", ""), 0.0),
             dry_run=dry_run,
         )
 

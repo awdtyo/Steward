@@ -1,0 +1,27 @@
+{"ticks": [
+  {"readings": [
+    {"source": "system", "service": "host", "metric": "mem_used_pct", "value": 42.0, "unit": "%", "ts": 1700000000, "ok": true},
+    {"source": "system", "service": "host", "metric": "disk_used_pct", "value": 55.0, "unit": "%", "ts": 1700000000, "ok": true},
+    {"source": "system", "service": "host", "metric": "temp_c", "value": 48.0, "unit": "C", "ts": 1700000000, "ok": true},
+    {"source": "docker", "service": "jellyfin", "metric": "container_state", "value": "running", "ts": 1700000000, "ok": true},
+    {"source": "tailscale", "service": "tailscale", "metric": "online", "value": true, "ts": 1700000000, "ok": true}
+  ]},
+  {"readings": [
+    {"source": "system", "service": "host", "metric": "mem_used_pct", "value": 82.0, "unit": "%", "ts": 1700000600, "ok": true},
+    {"source": "system", "service": "host", "metric": "disk_used_pct", "value": 86.0, "unit": "%", "ts": 1700000600, "ok": true},
+    {"source": "docker", "service": "jellyfin", "metric": "container_state", "value": "exited", "ts": 1700000600, "ok": true},
+    {"source": "docker", "service": "jellyfin", "metric": "docker_event", "value": "die", "ts": 1700000600, "ok": true},
+    {"source": "tailscale", "service": "tailscale", "metric": "online", "value": true, "ts": 1700000600, "ok": true}
+  ]},
+  {"readings": [
+    {"source": "system", "service": "host", "metric": "mem_used_pct", "value": 95.0, "unit": "%", "ts": 1700001200, "ok": true},
+    {"source": "system", "service": "host", "metric": "temp_c", "value": 83.0, "unit": "C", "ts": 1700001200, "ok": true},
+    {"source": "tailscale", "service": "tailscale", "metric": "online", "value": false, "ts": 1700001200, "ok": true}
+  ]},
+  {"readings": [
+    {"source": "system", "service": "host", "metric": "mem_used_pct", "value": 40.0, "unit": "%", "ts": 1700001800, "ok": true},
+    {"source": "system", "service": "host", "metric": "temp_c", "value": 47.0, "unit": "C", "ts": 1700001800, "ok": true},
+    {"source": "docker", "service": "jellyfin", "metric": "container_state", "value": "running", "ts": 1700001800, "ok": true},
+    {"source": "tailscale", "service": "tailscale", "metric": "online", "value": true, "ts": 1700001800, "ok": true}
+  ]}
+]}
