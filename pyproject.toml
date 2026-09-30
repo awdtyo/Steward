@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "steward"
+version = "0.1.0"
+description = "Always-on AI operator for a Raspberry Pi 5 homelab."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12,<3.13"
+# Minimal deps to stay under 250 MB RAM. Do not add without documenting why.
+dependencies = [
+  "fastapi>=0.115,<0.117",  # HTTP API + dashboard backend
+  "uvicorn>=0.30,<0.35",  # ASGI server (no heavy framework)
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8,<9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/steward"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

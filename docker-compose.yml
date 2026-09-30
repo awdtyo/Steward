@@ -1,0 +1,10 @@
+services:
+  steward:
+    build: .
+    platform: linux/arm64
+    restart: unless-stopped
+    mem_limit: 256m
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
