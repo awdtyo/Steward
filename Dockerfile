@@ -18,5 +18,5 @@ USER steward
 
 EXPOSE 8000
 
-# Placeholder until the FastAPI app lands; keeps the container bootable.
-CMD ["python", "-c", "import steward; print('steward', steward.__version__)"]
+# Dashboard only listens on loopback; expose it via `tailscale serve`.
+CMD ["python", "-m", "steward.app"]

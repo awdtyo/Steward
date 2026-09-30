@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$title — steward</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 0 auto; padding: 1rem; }
+nav a { margin-right: 1rem; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ccc; padding: 0.35rem 0.6rem; text-align: left; }
+.critical { color: #b00020; } .warning { color: #8a5a00; } .info { color: #1a5fb4; }
+.muted { color: #666; font-size: 0.85rem; }
+</style>
+<script src="https://unpkg.com/htmx.org@2.0.4"></script>
+<script src="https://cdn.jsdelivr.net/npm/htmx-ext-sse@2.0.0/sse.js"></script>
+</head>
+<body hx-boost="true">
+<nav><a href="/">Status</a><a href="/incidents">Incidents</a></nav>
+<main>
+$content
+</main>
+</body>
+</html>

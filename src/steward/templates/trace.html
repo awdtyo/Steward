@@ -1,0 +1,10 @@
+<h1>Agent trace</h1>
+<p class="muted">$incident_key</p>
+<h2>Diagnosis</h2>
+$diagnosis_block
+<h2>Steps</h2>
+<table>
+<tr><th>#</th><th>Kind</th><th>Model</th><th>Tool / args</th><th>Tokens</th><th>Redactions</th><th>Latency</th><th>Output / error</th></tr>
+$step_rows
+</table>
+<p><a href="/incidents/$incident_url">Back to incident</a></p>
