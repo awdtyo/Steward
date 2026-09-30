@@ -81,6 +81,61 @@ CREATE TABLE IF NOT EXISTS diagnoses (
   escalated INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_diagnoses_key ON diagnoses (incident_key);
+CREATE TABLE IF NOT EXISTS actions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL,
+  incident_key TEXT NOT NULL DEFAULT '',
+  tier INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  args_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'proposed',
+  requested_by TEXT NOT NULL DEFAULT '',
+  approved_by TEXT NOT NULL DEFAULT '',
+  decided_ts REAL,
+  snapshot_id INTEGER,
+  rollback_plan TEXT NOT NULL DEFAULT '',
+  result TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_actions_status ON actions (status);
+CREATE TABLE IF NOT EXISTS snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL,
+  action_id INTEGER NOT NULL,
+  compose_text TEXT NOT NULL DEFAULT '',
+  config_json TEXT NOT NULL DEFAULT '{}',
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  details_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log (ts);
+-- Append-only: updates and deletes are rejected at the database level.
+CREATE TRIGGER IF NOT EXISTS audit_log_no_update
+BEFORE UPDATE ON audit_log
+BEGIN
+  SELECT RAISE(ABORT, 'audit_log is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS audit_log_no_delete
+BEFORE DELETE ON audit_log
+BEGIN
+  SELECT RAISE(ABORT, 'audit_log is append-only');
+END;
+-- Hand-logged incident memory (CLI): symptom/cause/fix recall.
+CREATE TABLE IF NOT EXISTS memory (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL,
+  service TEXT NOT NULL DEFAULT '',
+  symptom TEXT NOT NULL,
+  cause TEXT NOT NULL DEFAULT '',
+  fix TEXT NOT NULL DEFAULT '',
+  tags TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_memory_service ON memory (service);
 """
 
 
@@ -243,17 +298,163 @@ def get_trace(conn: sqlite3.Connection,
     return diagnosis, steps
 
 
+def insert_action(conn: sqlite3.Connection, *, incident_key: str, tier: int,
+                  kind: str, args_json: str, status: str, requested_by: str,
+                  approved_by: str = "", snapshot_id: int | None = None,
+                  rollback_plan: str = "") -> int:
+    cur = conn.execute(
+        """INSERT INTO actions
+             (ts, incident_key, tier, kind, args_json, status, requested_by,
+              approved_by, snapshot_id, rollback_plan)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (time.time(), incident_key, tier, kind, args_json, status,
+         requested_by, approved_by, snapshot_id, rollback_plan),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_action(conn: sqlite3.Connection, action_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
+
+
+def list_actions(conn: sqlite3.Connection, *,
+                 status: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+    if status is None:
+        return list(conn.execute(
+            "SELECT * FROM actions ORDER BY id DESC LIMIT ?", (limit,)))
+    return list(conn.execute(
+        "SELECT * FROM actions WHERE status=? ORDER BY id DESC LIMIT ?",
+        (status, limit)))
+
+
+def set_action(conn: sqlite3.Connection, action_id: int, **fields) -> None:
+    """Update whitelisted action columns (status lifecycle only)."""
+    allowed = {"status", "approved_by", "decided_ts", "snapshot_id",
+               "result", "error"}
+    updates = {key: value for key, value in fields.items() if key in allowed}
+    if not updates:
+        raise ValueError("No updatable action fields provided")
+    assignments = ", ".join(f"{key}=?" for key in updates)
+    conn.execute(f"UPDATE actions SET {assignments} WHERE id=?",
+                 (*updates.values(), action_id))
+    conn.commit()
+
+
+def save_snapshot(conn: sqlite3.Connection, action_id: int, compose_text: str,
+                  config_json: str, note: str = "") -> int:
+    cur = conn.execute(
+        """INSERT INTO snapshots
+             (ts, action_id, compose_text, config_json, note)
+           VALUES (?, ?, ?, ?, ?)""",
+        (time.time(), action_id, compose_text, config_json, note),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_snapshot(conn: sqlite3.Connection,
+                 snapshot_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM snapshots WHERE id=?", (snapshot_id,)).fetchone()
+
+
+def audit_append(conn: sqlite3.Connection, actor: str, action: str,
+                 details: dict | str = "") -> int:
+    """Append one audit entry. There is no update or delete path."""
+    if not isinstance(details, str):
+        import json as _json
+        details = _json.dumps(details, default=str)
+    cur = conn.execute(
+        "INSERT INTO audit_log (ts, actor, action, details_json)"
+        " VALUES (?, ?, ?, ?)",
+        (time.time(), actor, action, details),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def audit_list(conn: sqlite3.Connection, limit: int = 200) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)))
+
+
+def audit_for_action(conn: sqlite3.Connection,
+                     action_id: int) -> list[sqlite3.Row]:
+    """Audit entries referencing one action (newest first)."""
+    import json as _json
+
+    out = []
+    for row in audit_list(conn, limit=1000):
+        try:
+            details = _json.loads(row["details_json"])
+        except (ValueError, TypeError):
+            continue
+        if isinstance(details, dict) and details.get("action_id") == action_id:
+            out.append(row)
+    return out
+
+
+def memory_add(conn: sqlite3.Connection, *, service: str = "",
+               symptom: str, cause: str = "", fix: str = "",
+               tags: str = "") -> int:
+    """Hand-log one incident into memory. Symptom is required."""
+    if not symptom.strip():
+        raise ValueError("Symptom is required")
+    cur = conn.execute(
+        """INSERT INTO memory (ts, service, symptom, cause, fix, tags)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (time.time(), service.strip(), symptom.strip(), cause.strip(),
+         fix.strip(), tags.strip()),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def memory_list(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM memory ORDER BY id DESC LIMIT ?", (limit,)))
+
+
+def memory_search(conn: sqlite3.Connection, query: str,
+                  limit: int = 20) -> list[sqlite3.Row]:
+    """Substring recall over service/symptom/cause/fix/tags."""
+    escaped = (query.replace("\\", "\\\\").replace("%", "\\%")
+               .replace("_", "\\_"))
+    like = f"%{escaped}%"
+    return list(conn.execute(
+        """SELECT * FROM memory
+           WHERE service LIKE ? ESCAPE '\\' OR symptom LIKE ? ESCAPE '\\'
+             OR cause LIKE ? ESCAPE '\\' OR fix LIKE ? ESCAPE '\\'
+             OR tags LIKE ? ESCAPE '\\'
+           ORDER BY id DESC LIMIT ?""",
+        (like, like, like, like, like, limit)))
+
+
 __all__ = [
+    "audit_append",
+    "audit_for_action",
+    "audit_list",
+    "get_action",
     "get_incident",
     "get_open",
+    "get_snapshot",
     "get_trace",
     "init_db",
+    "insert_action",
+    "list_actions",
     "llm_usage_totals",
     "log_llm_call",
     "mark_alerted",
+    "memory_add",
+    "memory_list",
+    "memory_search",
     "resolve_incident",
     "save_agent_step",
     "save_diagnosis",
     "save_readings",
+    "save_snapshot",
+    "set_action",
     "upsert_incident",
 ]

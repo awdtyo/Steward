@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import html
 import itertools
+import secrets
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -21,10 +22,12 @@ from string import Template
 from urllib.parse import quote
 
 import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
+from . import actions as actions_module
 from . import collectors, store
+from .agent_tools import LiveBackend, MockBackend, ToolDenied, ToolError
 from .collectors import Reading
 from .config import Settings, load_config
 from .dryrun import load_fixture
@@ -136,8 +139,12 @@ def _incident_item(row: sqlite3.Row) -> str:
 
 
 def create_app(settings: Settings, conn: sqlite3.Connection,
-               beat_interval: float = 5.0) -> FastAPI:
+               beat_interval: float = 5.0, backend=None) -> FastAPI:
     """Build the dashboard app. No network activity at construction."""
+    if backend is None:
+        backend = MockBackend() if settings.dry_run else LiveBackend(
+            compose_path=settings.compose_path)
+    csrf_token = secrets.token_urlsafe(32)
     if settings.dry_run:
         try:
             ticks = itertools.cycle(load_fixture())
@@ -264,6 +271,180 @@ def create_app(settings: Settings, conn: sqlite3.Connection,
         return StreamingResponse(_stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
                                           "X-Accel-Buffering": "no"})
+
+    def _identity(request: Request) -> str:
+        # Tailscale Serve injects this header; direct access has none and
+        # therefore can never approve (fail closed).
+        return (request.headers.get(settings.tailscale_user_header)
+                or "").strip()
+
+    def _with_csrf(content: str) -> HTMLResponse:
+        response = HTMLResponse(content)
+        response.set_cookie("steward_csrf", csrf_token, httponly=True,
+                            samesite="strict")
+        return response
+
+    async def _privileged(request: Request):
+        """Validate CSRF + confirm + identity. Returns (identity, form)."""
+        form = await request.form()
+        cookie = request.cookies.get("steward_csrf", "")
+        submitted = str(form.get("csrf_token", ""))
+        if not submitted or not cookie or not secrets.compare_digest(
+                submitted, csrf_token) or not secrets.compare_digest(
+                cookie, csrf_token):
+            return None, HTMLResponse(
+                _page("Forbidden", "<h1>CSRF check failed</h1>"), 403)
+        if form.get("confirm") != "yes":
+            return None, HTMLResponse(
+                _page("Confirm required",
+                      "<h1>Confirmation required</h1>"
+                      "<p>Tick the confirm box to proceed.</p>"), 400)
+        identity = _identity(request)
+        if not identity:
+            return None, HTMLResponse(
+                _page("Forbidden",
+                      "<h1>Unknown identity</h1>"
+                      "<p>Approvals require Tailscale Serve identity.</p>"),
+                403)
+        allowed = settings.allowed_approver
+        if not allowed or identity.lower() != allowed.lower():
+            return None, HTMLResponse(
+                _page("Forbidden",
+                      "<h1>Not authorized</h1>"
+                      "<p>This identity may not approve actions.</p>"),
+                403)
+        return identity, form
+
+    def _action_item(row: sqlite3.Row) -> str:
+        return (
+            f"<li>[{esc(row['status'])}] Tier {esc(row['tier'])} "
+            f"<a href=\"/approvals/{esc(row['id'])}\">"
+            f"#{esc(row['id'])} {esc(row['kind'])}</a> "
+            f"<span class=\"muted\">{esc(row['requested_by'])}</span></li>"
+        )
+
+    @app.get("/approvals", response_class=HTMLResponse)
+    def approvals_list(request: Request):
+        pending = store.list_actions(conn, status="proposed")
+        recent = [row for row in store.list_actions(conn, limit=20)
+                  if row["status"] != "proposed"][:20]
+        content = _template("approvals.html").safe_substitute(
+            identity=esc(_identity(request) or "unknown (read-only)"),
+            pending_items="\n".join(_action_item(r) for r in pending)
+            or "<li>None</li>",
+            recent_items="\n".join(_action_item(r) for r in recent)
+            or "<li>None</li>",
+        )
+        return _with_csrf(_page("Approvals", content))
+
+    @app.get("/approvals/{action_id:int}", response_class=HTMLResponse)
+    def approval_detail(action_id: int):
+        row = store.get_action(conn, action_id)
+        if row is None:
+            return HTMLResponse(
+                _page("Not found", "<h1>Unknown action</h1>"), 404)
+        snapshot_info = "None"
+        if row["snapshot_id"]:
+            snapshot = store.get_snapshot(conn, row["snapshot_id"])
+            if snapshot is not None:
+                compose = snapshot["compose_text"]
+                if len(compose) > 1000:
+                    compose = compose[:1000] + "..."
+                snapshot_info = (
+                    f"#{esc(snapshot['id'])} at "
+                    f"{esc(_fmt_ts(snapshot['ts']))}<br>"
+                    f"compose ({esc(len(snapshot['compose_text']))} chars):"
+                    f"<pre>{esc(compose)}</pre>"
+                    f"note: {esc(snapshot['note'])}")
+        forms = ""
+        if row["status"] == "proposed":
+            forms = (
+                f"<form method=\"post\" action=\"/approvals/{row['id']}/approve\">"
+                f"<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\">"
+                "<label><input type=\"checkbox\" name=\"confirm\" value=\"yes\"> "
+                "I confirm this action</label> "
+                "<button type=\"submit\">Approve and execute</button></form>"
+                f"<form method=\"post\" action=\"/approvals/{row['id']}/deny\">"
+                f"<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\">"
+                "<label><input type=\"checkbox\" name=\"confirm\" value=\"yes\"> "
+                "I confirm this decision</label> "
+                "<input name=\"reason\" placeholder=\"Reason (optional)\"> "
+                "<button type=\"submit\">Deny</button></form>")
+        elif row["status"] == "approved":
+            forms = (
+                f"<form method=\"post\" action=\"/approvals/{row['id']}/execute\">"
+                f"<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\">"
+                "<label><input type=\"checkbox\" name=\"confirm\" value=\"yes\"> "
+                "I confirm execution</label> "
+                "<button type=\"submit\">Execute</button></form>")
+        elif row["status"] == "executed" and row["tier"] == 2:
+            forms = (
+                f"<form method=\"post\" action=\"/approvals/{row['id']}/rollback\">"
+                f"<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\">"
+                "<label><input type=\"checkbox\" name=\"confirm\" value=\"yes\"> "
+                "I confirm rollback</label> "
+                "<button type=\"submit\">Roll back</button></form>")
+        audit_items = "\n".join(
+            f"<li>{esc(_fmt_ts(entry['ts']))} {esc(entry['actor'])} "
+            f"{esc(entry['action'])} "
+            f"<span class=\"muted\">{esc(entry['details_json'][:200])}</span></li>"
+            for entry in store.audit_for_action(conn, row["id"])
+        ) or "<li>None</li>"
+        content = _template("approval.html").safe_substitute(
+            action_id=esc(row["id"]), kind=esc(row["kind"]),
+            tier=esc(row["tier"]), status=esc(row["status"]),
+            incident_key=esc(row["incident_key"] or "—"),
+            requested_by=esc(row["requested_by"]),
+            approved_by=esc(row["approved_by"] or "—"),
+            args_json=esc(row["args_json"]),
+            rollback_plan=esc(row["rollback_plan"] or "—"),
+            snapshot_info=snapshot_info,
+            result=esc(row["result"] or row["error"] or "—"),
+            forms=forms, audit_items=audit_items,
+        )
+        return _with_csrf(_page(f"Action #{row['id']}", content))
+
+    async def _decide(request: Request, action_id: int, verb: str):
+        identity, form = await _privileged(request)
+        if identity is None:
+            return form  # error response
+        try:
+            if verb == "approve":
+                actions_module.approve_and_execute(
+                    conn, settings, backend, action_id, approver=identity)
+            elif verb == "deny":
+                actions_module.deny_action(
+                    conn, settings, action_id, approver=identity,
+                    reason=str(form.get("reason", "")))
+            elif verb == "execute":
+                actions_module.execute_action(
+                    conn, settings, backend, action_id, actor=identity)
+            elif verb == "rollback":
+                actions_module.rollback_action(
+                    conn, settings, backend, action_id, actor=identity)
+        except (ToolDenied, ToolError) as exc:
+            return HTMLResponse(
+                _page("Action failed",
+                      f"<h1>Action failed</h1><p>{esc(exc)}</p>"
+                      f"<p><a href=\"/approvals/{action_id}\">Back</a></p>"),
+                400)
+        return RedirectResponse(f"/approvals/{action_id}", status_code=303)
+
+    @app.post("/approvals/{action_id:int}/approve")
+    async def approval_approve(request: Request, action_id: int):
+        return await _decide(request, action_id, "approve")
+
+    @app.post("/approvals/{action_id:int}/deny")
+    async def approval_deny(request: Request, action_id: int):
+        return await _decide(request, action_id, "deny")
+
+    @app.post("/approvals/{action_id:int}/execute")
+    async def approval_execute(request: Request, action_id: int):
+        return await _decide(request, action_id, "execute")
+
+    @app.post("/approvals/{action_id:int}/rollback")
+    async def approval_rollback(request: Request, action_id: int):
+        return await _decide(request, action_id, "rollback")
 
     return app
 

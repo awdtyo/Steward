@@ -71,7 +71,7 @@ def build_system_prompt() -> str:
         "You are steward, a read-only homelab diagnostician. "
         "You may ONLY use the Tier-0 read-only tools below; you cannot "
         "change anything, and there are no other tools.\n\n"
-        "Tools:\n" + tool_specs_for_prompt() + "\n\n"
+        "Tools:\n" + tool_specs_for_prompt(tier=0) + "\n\n"
         "Protocol: reply with exactly one JSON object per turn, either\n"
         '  {"call": {"tool": "<name>", "args": {...}}}  to call one tool, or\n'
         '  {"diagnosis": {"summary": "...", "likely_cause": "...", '
@@ -86,12 +86,19 @@ def build_system_prompt() -> str:
     )
 
 
-def _incident_brief(incident: Incident) -> str:
-    return (
+def _incident_brief(incident: Incident, service_specs=None) -> str:
+    brief = (
         f"Incident {incident.key} ({incident.severity}): {incident.title}\n"
         f"Service: {incident.service}. Rule: {incident.rule}.\n"
         "Investigate with Tier-0 tools and finish with a diagnosis."
     )
+    # Known log patterns for this service (labels only, never log text).
+    for spec in service_specs or []:
+        if spec.name == incident.service and spec.log_hints:
+            hints = ", ".join(
+                f"{hint.label} ({hint.severity})" for hint in spec.log_hints)
+            brief += f"\nKnown log patterns for {spec.name}: {hints}."
+    return brief
 
 
 def _wrap_tool_output(tool: str, redacted_text: str, is_log: bool) -> str:
@@ -178,7 +185,8 @@ def diagnose(settings: Settings, incident: Incident, *,
              backend: Backend | None = None,
              llm_chat=None,
              max_steps: int = MAX_STEPS,
-             store_conn=None) -> Diagnosis:
+             store_conn=None,
+             service_specs=None) -> Diagnosis:
     """Run the tool-calling loop for one incident. Raises VaultwardenRefusal
     for protected-service incidents before doing any work."""
     searchable = f"{incident.service} {incident.key} {incident.title}".lower()
@@ -194,7 +202,8 @@ def diagnose(settings: Settings, incident: Incident, *,
     model = select_model(settings, kind).model
 
     messages = [{"role": "system", "content": build_system_prompt()},
-                {"role": "user", "content": _incident_brief(incident)}]
+                {"role": "user", "content": _incident_brief(
+                    incident, service_specs)}]
     steps: list[StepRecord] = []
     diagnosis: Diagnosis | None = None
     n = 0

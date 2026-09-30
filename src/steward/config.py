@@ -68,6 +68,12 @@ class Settings:
     redact_deny: tuple[str, ...] = ()
     llm_price_input_per_1k: float = 0.0
     llm_price_output_per_1k: float = 0.0
+    tier1_allow_services: tuple[str, ...] = ("jellyfin", "nextcloud")
+    allowed_approver: str = ""
+    tailscale_user_header: str = "Tailscale-User-Login"
+    compose_path: str = "docker-compose.yml"
+    services_path: str = "services.yaml"
+    vaultwarden_backup_dir: str = ""
     dry_run: bool = False
 
     @classmethod
@@ -124,6 +130,17 @@ class Settings:
             llm_price_output_per_1k=_parse_float(
                 "LLM_PRICE_OUTPUT_PER_1K",
                 env.get("LLM_PRICE_OUTPUT_PER_1K", ""), 0.0),
+            tier1_allow_services=_parse_csv(
+                env.get("TIER1_ALLOW_SERVICES", "jellyfin,nextcloud")),
+            allowed_approver=env.get("ALLOWED_APPROVER", "").strip(),
+            tailscale_user_header=env.get("TAILSCALE_USER_HEADER", "").strip()
+            or "Tailscale-User-Login",
+            compose_path=env.get("COMPOSE_PATH", "").strip()
+            or "docker-compose.yml",
+            services_path=env.get("SERVICES_PATH", "").strip()
+            or "services.yaml",
+            vaultwarden_backup_dir=env.get(
+                "VAULTWARDEN_BACKUP_DIR", "").strip(),
             dry_run=dry_run,
         )
 

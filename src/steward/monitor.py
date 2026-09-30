@@ -13,6 +13,7 @@ import time
 
 from . import alerts
 from .agent import diagnose_and_store
+from .agent_tools import LiveBackend, MockBackend
 from .alerts import row_to_incident
 from .collectors import Reading, collect_all
 from .config import Settings
@@ -20,6 +21,7 @@ from .dryrun import replay
 from .heartbeat import Heartbeat
 from .llm import VaultwardenRefusal
 from .rules import Deduper, evaluate
+from . import services as services_module
 from . import store as store_module
 
 _SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
@@ -33,7 +35,8 @@ def tick(settings: Settings,
          readings: list[Reading] | None = None,
          run_diagnosis: bool = True,
          backend=None,
-         llm_chat=None) -> dict:
+         llm_chat=None,
+         service_specs=None) -> dict:
     """Run one monitoring pass. Returns a small summary dict."""
     now = time.time() if now is None else now
     if readings is None:
@@ -47,6 +50,21 @@ def tick(settings: Settings,
 
     store_module.save_readings(conn, readings)
     active = evaluate(readings, now=now)
+    service_incidents: list = []
+    if service_specs:
+        check_backend = backend
+        if check_backend is None:
+            check_backend = MockBackend() if settings.dry_run \
+                else LiveBackend()
+        health = services_module.run_health_checks(
+            service_specs, check_backend,
+            backup_dir=settings.vaultwarden_backup_dir,
+            dry_run=settings.dry_run)
+        store_module.save_readings(
+            conn, services_module.services_to_readings(health, now=now))
+        service_incidents = services_module.services_to_incidents(
+            health, now=now)
+        active = active + service_incidents
     active_keys = {i.key for i in active}
     fired = []
     for incident in active:
@@ -93,7 +111,8 @@ def tick(settings: Settings,
         for incident in fired:
             try:
                 diagnose_and_store(settings, conn, incident,
-                                   backend=backend, llm_chat=llm_chat)
+                                   backend=backend, llm_chat=llm_chat,
+                                   service_specs=service_specs)
                 diagnosed.append(incident.key)
             except (VaultwardenRefusal, Exception):
                 # Never let diagnosis break the monitoring pass.
@@ -101,7 +120,8 @@ def tick(settings: Settings,
 
     return {"active": len(active), "resolved": resolved,
             "mailed": mailed, "heartbeat": hb, "diagnosed": diagnosed,
-            "diagnosis_skipped": diagnosis_skipped}
+            "diagnosis_skipped": diagnosis_skipped,
+            "service_incidents": [i.key for i in service_incidents]}
 
 
 def send_digest_for_open(settings: Settings,

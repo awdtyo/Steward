@@ -1,10 +1,16 @@
-"""Agent tools: Tier 0 (read-only) only, allowlisted, JSON schemas.
+"""Agent tools: allowlisted, JSON schemas, tiered.
 
-AGENTS.md: the agent may only call named tools defined in code. Every tool
-here is read-only; mutating tiers do not exist yet. Vaultwarden is excluded
+AGENTS.md: the agent may only call named tools defined in code. Tier 0 is
+read-only; Tier 1 is reversible/automatic (restart, cache clear, both bound
+to a per-service allowlist); Tier 2 edits config or volumes and always needs
+a human approval plus a snapshot (see actions.py). Vaultwarden is excluded
 by code (not by prompt): any service/path argument referencing it raises
 ToolDenied before anything runs, in both the central dispatcher and each
 individual tool.
+
+run_agent_tool() only runs Tier 0 (the diagnosis loop uses it, so the
+diagnosing agent can never trigger a mutation). Mutating tiers run only via
+actions.run_action_tool().
 """
 
 from __future__ import annotations
@@ -13,6 +19,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .collectors import Reading, collect_all
@@ -85,9 +92,27 @@ class Backend:
     def latest_metrics(self, service: str | None = None) -> list[dict]:
         raise NotImplementedError
 
+    # -- Tier 1/2 primitives (mutating; only reachable via actions.py) --
+
+    def container_restart(self, service: str) -> dict:
+        raise NotImplementedError
+
+    def container_clear_cache(self, service: str,
+                              paths: tuple[str, ...]) -> dict:
+        raise NotImplementedError
+
+    def compose_text(self) -> str:
+        raise NotImplementedError
+
+    def compose_restore(self, text: str) -> dict:
+        raise NotImplementedError
+
 
 class LiveBackend(Backend):
-    """Real Tier-0 sampling: docker SDK (read-only), stdlib, collectors."""
+    """Real Tier-0 sampling plus Tier-1/2 primitives (docker SDK, files)."""
+
+    def __init__(self, compose_path: str = "docker-compose.yml") -> None:
+        self.compose_path = compose_path
 
     def container_logs(self, service: str, lines: int) -> str:
         try:
@@ -161,6 +186,57 @@ class LiveBackend(Backend):
             out.append(item)
         return out
 
+    def _container(self, service: str):
+        try:
+            import docker
+        except ImportError as exc:
+            raise ToolError("docker SDK unavailable") from exc
+        try:
+            return docker.from_env(timeout=10).containers.get(service)
+        except Exception as exc:
+            raise ToolError(f"Container {service} unavailable: {exc}") from exc
+
+    def container_restart(self, service: str) -> dict:
+        try:
+            self._container(service).restart(timeout=30)
+        except ToolError:
+            raise
+        except Exception as exc:
+            raise ToolError(f"Restart of {service} failed: {exc}") from exc
+        return {"restarted": True, "service": service}
+
+    def container_clear_cache(self, service: str,
+                              paths: tuple[str, ...]) -> dict:
+        # Fixed argv, no shell: only the allowlisted tmp dirs are removed.
+        try:
+            result = self._container(service).exec_run(
+                ["rm", "-rf", *paths], demux=False)
+            exit_code = getattr(result, "exit_code", result[0]
+                                if isinstance(result, tuple) else 1)
+        except ToolError:
+            raise
+        except Exception as exc:
+            raise ToolError(f"Cache clear on {service} failed: {exc}") from exc
+        if exit_code != 0:
+            raise ToolError(f"Cache clear on {service} exited {exit_code}")
+        return {"cleared": True, "service": service,
+                "paths": list(paths)}
+
+    def compose_text(self) -> str:
+        try:
+            return Path(self.compose_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ToolError(f"Cannot read {self.compose_path}: {exc}") from exc
+
+    def compose_restore(self, text: str) -> dict:
+        if not text or "services" not in text:
+            raise ToolError("Refusing to write an invalid compose file")
+        try:
+            Path(self.compose_path).write_text(text, encoding="utf-8")
+        except OSError as exc:
+            raise ToolError(f"Cannot write {self.compose_path}: {exc}") from exc
+        return {"restored": True, "bytes": len(text)}
+
 
 class MockBackend(Backend):
     """Canned Tier-0 data for tests and dry-run mode."""
@@ -168,13 +244,21 @@ class MockBackend(Backend):
     def __init__(self, *, logs: dict | None = None,
                  inspect: dict | None = None, disk: dict | None = None,
                  mounts: dict | None = None,
-                 metrics: list[Reading] | None = None) -> None:
+                 metrics: list[Reading] | None = None,
+                 fail_services: tuple[str, ...] = (),
+                 compose_text: str = "services:\n  placeholder:\n"
+                                     "    image: example/placeholder\n") -> None:
         self.logs = dict(logs or {})
         self.inspect = dict(inspect or {})
         self.disk = dict(disk or {"path": "/", "used_pct": 42.0})
         self.mounts = dict(mounts or {})
         self.metrics = list(metrics or [])
+        self.fail_services = set(fail_services)
+        self.compose_text_value = compose_text
         self.calls: list[tuple[str, dict]] = []
+        self.restarts: list[str] = []
+        self.cleared: list[tuple[str, tuple[str, ...]]] = []
+        self.restored_texts: list[str] = []
 
     def container_logs(self, service: str, lines: int) -> str:
         self.calls.append(("read_logs", {"service": service, "lines": lines}))
@@ -208,6 +292,33 @@ class MockBackend(Backend):
             out.append(item)
         return out
 
+    def container_restart(self, service: str) -> dict:
+        self.calls.append(("restart_container", {"service": service}))
+        self.restarts.append(service)
+        if service in self.fail_services:
+            raise ToolError(f"Mock restart failure for {service}")
+        return {"restarted": True, "service": service}
+
+    def container_clear_cache(self, service: str,
+                              paths: tuple[str, ...]) -> dict:
+        self.calls.append(("clear_cache",
+                           {"service": service, "paths": list(paths)}))
+        self.cleared.append((service, tuple(paths)))
+        if service in self.fail_services:
+            raise ToolError(f"Mock cache-clear failure for {service}")
+        return {"cleared": True, "service": service,
+                "paths": list(paths)}
+
+    def compose_text(self) -> str:
+        self.calls.append(("compose_read", {}))
+        return self.compose_text_value
+
+    def compose_restore(self, text: str) -> dict:
+        self.calls.append(("compose_restore", {"bytes": len(text)}))
+        self.restored_texts.append(text)
+        self.compose_text_value = text
+        return {"restored": True, "bytes": len(text)}
+
 
 def _truncate(text: str, limit: int = _MAX_LOG_CHARS) -> str:
     if len(text) > limit:
@@ -237,6 +348,38 @@ def _get_metrics(args: dict, backend: Backend) -> list[dict]:
     if service is not None:
         _check_service(service)
     return backend.latest_metrics(service)
+
+
+# Fixed cache targets for clear_cache: container tmp dirs only. Tmp is by
+# definition disposable, which keeps this Tier 1 (reversible, automatic).
+CACHE_CLEAR_PATHS = ("/tmp", "/var/tmp")
+
+
+def _restart_container(args: dict, backend: Backend) -> dict:
+    return backend.container_restart(_check_service(args.get("service")))
+
+
+def _clear_cache(args: dict, backend: Backend) -> dict:
+    service = _check_service(args.get("service"))
+    return backend.container_clear_cache(service, CACHE_CLEAR_PATHS)
+
+
+def _restore_snapshot(args: dict, backend: Backend) -> dict:
+    # Snapshot text is injected by the rollback flow (actions.py), never by
+    # the agent: the schema only requires the id for audit clarity.
+    text = args.get("compose_text", "")
+    if not isinstance(text, str) or "services" not in text:
+        raise ToolDenied("restore_snapshot needs snapshot compose text")
+    return backend.compose_restore(text)
+
+
+def _config_change(args: dict, backend: Backend) -> dict:
+    # Proposal-only: there is deliberately no automatic executor for
+    # free-form config/volume changes. A human approves (snapshot stored)
+    # and performs the change manually following the rollback plan.
+    raise ToolDenied("config_change has no automatic executor: approve to "
+                     "record the decision and snapshot, then perform the "
+                     "change manually")
 
 
 @dataclass(frozen=True)
@@ -285,6 +428,37 @@ AGENT_TOOLS: dict[str, AgentTool] = {
          "properties": {"service": {"type": "string"}},
          "required": [], "additionalProperties": False},
         _get_metrics),
+    "restart_container": AgentTool(
+        "restart_container", "Tier 1: restart one allowlisted service"
+        " container (reversible, automatic, logged).", 1,
+        {"type": "object",
+         "properties": {"service": {"type": "string"}},
+         "required": ["service"], "additionalProperties": False},
+        _restart_container),
+    "clear_cache": AgentTool(
+        "clear_cache", "Tier 1: remove container tmp dirs (/tmp, /var/tmp)"
+        " on one allowlisted service (reversible, automatic, logged).", 1,
+        {"type": "object",
+         "properties": {"service": {"type": "string"}},
+         "required": ["service"], "additionalProperties": False},
+        _clear_cache),
+    "restore_snapshot": AgentTool(
+        "restore_snapshot", "Tier 2: restore the compose file from a"
+        " snapshot (rollback path; needs approval + snapshot).", 2,
+        {"type": "object",
+         "properties": {"snapshot_id": {"type": "integer", "minimum": 1},
+                        "compose_text": {"type": "string"}},
+         "required": ["snapshot_id"], "additionalProperties": False},
+        _restore_snapshot),
+    "config_change": AgentTool(
+        "config_change", "Tier 2: proposal-only record for a config/volume"
+        " change (approval + snapshot stored; human performs the change).", 2,
+        {"type": "object",
+         "properties": {"service": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "target": {"type": "string"}},
+         "required": ["summary", "target"], "additionalProperties": False},
+        _config_change),
 }
 
 
@@ -346,14 +520,21 @@ def run_agent_tool(name: str, args: dict, backend: Backend) -> Any:
         raise ToolError(f"Tool {name} failed: {exc}") from exc
 
 
-def tool_specs_for_prompt() -> str:
-    """Render the tool registry as prompt text (names, tiers, schemas)."""
+def tool_specs_for_prompt(tier: int | None = None) -> str:
+    """Render the tool registry as prompt text, optionally tier-filtered.
+
+    The diagnosis loop passes tier=0 so the model only ever sees read-only
+    tools; run_agent_tool() enforces the same boundary in code.
+    """
     import json as _json
 
     lines = []
     for tool in AGENT_TOOLS.values():
+        if tier is not None and tool.tier != tier:
+            continue
+        scope = "read-only" if tool.tier == 0 else "restricted"
         lines.append(
-            f"- {tool.name} (Tier {tool.tier}, read-only): "
+            f"- {tool.name} (Tier {tool.tier}, {scope}): "
             f"{tool.description} Args: {_json.dumps(tool.schema)}")
     return "\n".join(lines)
 

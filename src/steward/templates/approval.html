@@ -1,0 +1,17 @@
+<h1>Action #$action_id — $kind</h1>
+<p><span>Tier $tier</span> · <span>$status</span></p>
+<table>
+<tr><th>Incident</th><td>$incident_key</td></tr>
+<tr><th>Requested by</th><td>$requested_by</td></tr>
+<tr><th>Decided by</th><td>$approved_by</td></tr>
+<tr><th>Args</th><td>$args_json</td></tr>
+<tr><th>Rollback plan</th><td>$rollback_plan</td></tr>
+<tr><th>Snapshot</th><td>$snapshot_info</td></tr>
+<tr><th>Result</th><td>$result</td></tr>
+</table>
+$forms
+<h2>Audit trail</h2>
+<ul>
+$audit_items
+</ul>
+<p><a href="/approvals">Back to approvals</a></p>

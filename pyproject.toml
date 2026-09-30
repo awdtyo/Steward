@@ -14,7 +14,12 @@ dependencies = [
   "fastapi>=0.115,<0.117",  # HTTP API + dashboard backend
   "uvicorn>=0.30,<0.35",  # ASGI server (no heavy framework)
   "docker>=7,<8",  # read-only Docker events/containers collector (no CLI parsing)
+  "python-multipart>=0.0.18,<0.1",  # form parsing for dashboard approval POSTs
+  "pyyaml>=6,<7",  # service definitions live in a YAML file (stdlib has no YAML parser)
 ]
+
+[project.scripts]
+steward = "steward.cli:main"
 
 [project.optional-dependencies]
 test = [
