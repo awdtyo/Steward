@@ -1,4 +1,5 @@
 .env
+services.yaml
 AGENTS.md
 __pycache__/
 *.py[cod]

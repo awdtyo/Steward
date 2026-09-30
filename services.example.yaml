@@ -1,0 +1,95 @@
+# Example steward service definitions. Copy to services.yaml (gitignored)
+# and adjust to your homelab. See README "Services" for the schema.
+#
+# Rules enforced in code, not just docs:
+# - monitor_only services (Vaultwarden) may only use container, tls_expiry,
+#   and backup checks, define no log hints, and allow no actions.
+# - Vaultwarden logs, env, and paths are never sent to the LLM.
+
+services:
+  - name: jellyfin
+    container: jellyfin
+    checks:
+      - type: container
+      - type: http
+        url: http://127.0.0.1:8096/health
+        timeout: 5
+    log_hints:
+      - pattern: "SQLite.*(locked|busy|corrupt)"
+        label: sqlite-lock
+        severity: warning
+      - pattern: "OutOfMemory|OOM killer|GC.*pressure"
+        label: out-of-memory
+        severity: critical
+      - pattern: "Permission denied.*(/media|/config)"
+        label: permissions
+        severity: warning
+      - pattern: "FFmpeg.*(failed|Error)"
+        label: transcode-failure
+        severity: info
+    allowed_actions: [restart_container, clear_cache]
+
+  - name: nextcloud
+    container: nextcloud
+    checks:
+      - type: container
+      - type: http
+        url: http://127.0.0.1:8080/status.php
+        timeout: 5
+    log_hints:
+      - pattern: "cron.*not.*run|Last cron was run"
+        label: cron-stale
+        severity: warning
+      - pattern: "Deadlock|database.*locked"
+        label: db-lock
+        severity: warning
+      - pattern: "Trusted domain error|not a trusted domain"
+        label: trusted-domain
+        severity: info
+      - pattern: "Redis.*(went away|connection .* failed)"
+        label: redis-down
+        severity: critical
+    allowed_actions: [restart_container]
+
+  - name: tailscale
+    container: tailscale
+    checks:
+      - type: container
+    log_hints:
+      - pattern: "derp.*(disconnected|no route)|No DERP"
+        label: derp-issue
+        severity: warning
+      - pattern: "auth.*(expir|fail)|needs re-auth"
+        label: auth-issue
+        severity: critical
+    allowed_actions: [restart_container]
+
+  - name: vaultwarden
+    container: vaultwarden
+    monitor_only: true
+    checks:
+      - type: container
+      - type: tls_expiry
+        host: 127.0.0.1
+        port: 8443
+        warn_days: 30
+        crit_days: 14
+      - type: backup
+        max_age_hours: 26
+    allowed_actions: []
+
+  - name: uptime-kuma
+    container: uptime-kuma
+    checks:
+      - type: container
+      - type: http
+        url: http://127.0.0.1:3001/
+        timeout: 5
+    log_hints:
+      - pattern: "EADDRINUSE|address already in use"
+        label: port-conflict
+        severity: critical
+      - pattern: "database.*locked|SQLITE_BUSY"
+        label: db-lock
+        severity: warning
+    allowed_actions: [restart_container]
